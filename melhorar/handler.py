@@ -8,6 +8,7 @@ Entrada (job["input"]):
   video_base64   trecho do talking.mp4 (~10 s, sem áudio)
   still_base64   frame original 1920x1080 (still.jpg)
   face_weight    0 a 1, força da restauração (padrão 0.7)
+  mouth_keep     0 a 1, quanto da restauração vale na boca (padrão 1; 0.25 deixa os dentes naturais)
   crf            qualidade do x264 (padrão 16)
 
 Saída: {"video_base64": "...", "bytes": n, "frames": n, "inference_s": s}
@@ -46,6 +47,8 @@ YY, XX = np.mgrid[0:512, 0:512]
 FACE_MASK = torch.from_numpy(
     (np.clip(1.2 - np.hypot((XX - 256) / 200, (YY - 270) / 235), 0, 1) ** 0.8).astype(np.float32)
 ).cuda()[None, None]
+# boca dentro do recorte de 512 (o GFPGAN vira os dentes num bloco branco)
+MOUTH = torch.from_numpy(np.clip(1.4 - np.hypot((XX - 256) / 85, (YY - 322) / 50), 0, 1).astype(np.float32)).cuda()[None, None]
 
 
 def probe(path: str):
@@ -68,7 +71,7 @@ def cover_1080(f: torch.Tensor) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def restore_face(img: torch.Tensor, box, weight: float) -> torch.Tensor:
+def restore_face(img: torch.Tensor, box, weight: float, face_mask: torch.Tensor) -> torch.Tensor:
     cx, cy, s = box
     s = int(min(s, H))
     x0 = int(max(0, min(W - s, cx - s / 2)))
@@ -77,7 +80,7 @@ def restore_face(img: torch.Tensor, box, weight: float) -> torch.Tensor:
     crop = F.interpolate(region, size=(512, 512), mode="bilinear", antialias=True, align_corners=False)
     out = MODEL(crop.flip(1) / 255).clamp(0, 1).flip(1) * 255  # o modelo quer RGB; o quadro é BGR
     back = F.interpolate(out, size=(s, s), mode="bicubic", align_corners=False)
-    m = F.interpolate(FACE_MASK, size=(s, s), mode="bilinear", align_corners=False) * weight
+    m = F.interpolate(face_mask, size=(s, s), mode="bilinear", align_corners=False) * weight
     img[..., y0:y0 + s, x0:x0 + s] = region * (1 - m) + back * m
     return img
 
@@ -94,6 +97,8 @@ def handler(job):
         still = cv2.imdecode(np.frombuffer(base64.b64decode(inp["still_base64"]), np.uint8), cv2.IMREAD_COLOR)
         still = torch.from_numpy(cv2.resize(still, (W, H))).cuda().permute(2, 0, 1)[None].float()
         weight = float(min(1.0, max(0.0, inp.get("face_weight", 0.7))))
+        mouth_keep = float(min(1.0, max(0.0, inp.get("mouth_keep", 1.0))))
+        face_mask = FACE_MASK * (1 - (1 - mouth_keep) * MOUTH)  # alivia a restauração na boca
         crf = str(int(inp.get("crf", 16)))
         w0, h0, fps = probe(src)
 
@@ -124,7 +129,7 @@ def handler(job):
                         cur = np.array([x + w / 2, y + h / 2 + 0.05 * h, w * 1.8])
                         box = cur if box is None else box * 0.7 + cur * 0.3
                 if box is not None:
-                    img = restore_face(img, box, weight)
+                    img = restore_face(img, box, weight, face_mask)
             enc.stdin.write(img.clamp(0, 255).round().byte()[0].permute(1, 2, 0).contiguous().cpu().numpy().tobytes())
             n += 1
         enc.stdin.close()
